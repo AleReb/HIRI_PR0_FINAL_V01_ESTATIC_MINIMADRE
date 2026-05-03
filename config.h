@@ -72,6 +72,10 @@ struct SystemConfig {
                     // 15=ALL (default: 15)
 };
 
+// -------------------- Global Configuration --------------------
+extern uint32_t RESTART_INTERVAL_HOURS;
+
+
 // -------------------- Display State Machine --------------------
 enum DisplayState {
   DISP_NORMAL,

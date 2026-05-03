@@ -89,6 +89,7 @@ bool hasRed = false;
 
 // Config Instance
 SystemConfig config;
+uint32_t RESTART_INTERVAL_HOURS = 3;
 
 // Objects configuracion de sensores y pantalla
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
@@ -664,6 +665,8 @@ void setup() {
   digitalWrite(GATE_MODEM, HIGH);
   delay(300);
   Serial.begin(115200);
+  Wire.setTimeOut(150); // Protection against I2C lockups
+
   pinMode(EN_5V_INT, OUTPUT);
   pinMode(GATE_3V3_INT, OUTPUT);
   pinMode(GATE_MODEM, OUTPUT);
@@ -1002,6 +1005,12 @@ bool FirstLoop = true;
 void loop() {
   esp_task_wdt_reset();
 
+  if (RESTART_INTERVAL_HOURS > 0 && millis() >= RESTART_INTERVAL_HOURS * 3600000UL) {
+    Serial.println("Auto-restart triggered!");
+    delay(100);
+    ESP.restart();
+  }
+
   // Button flags
   // Button Logic (State Check & Dispatch)
   handleButtonLogic();
@@ -1043,48 +1052,68 @@ void loop() {
   gnssDiagTick();
   gnssDebugPollAsync();
 
-  // Sensors refresh and print data every 2 seconds
+  // Sensors refresh asynchronous state machine (reads one sensor per interval)
   static uint32_t lastSensorUpdateMs = 0;
-  if (millis() - lastSensorUpdateMs >= 2000) {
+  static uint8_t sensorReadState = 0;
+  
+  if (millis() - lastSensorUpdateMs >= 500) { // Every 500ms we advance the state
     lastSensorUpdateMs = millis();
     
-    // ------------------- RTC Temperature
-    if (rtcOK) {
-      rtcTempC = rtc.getTemperature();
+    switch (sensorReadState) {
+      case 0:
+        // ------------------- RTC Temperature & Print PM100
+        if (rtcOK) {
+          rtcTempC = rtc.getTemperature();
+        }
+        Serial.print("PM100: ");
+        Serial.print(SDS198PM100);
+        Serial.println(" ug/m3");
+        break;
+
+      case 1:
+        // ------------------- Gas Sensor
+        if (GasOK) {
+          Serial.print("Ambient ");
+          Serial.print(gas.queryGasType());
+          Serial.print(" concentration is: ");
+          Serial.print(gas.readGasConcentrationPPM());
+          Serial.println(" %vol");
+          Serial.println();
+        }
+        break;
+
+      case 2:
+        // ------------------- SHT4x
+        if (SHT4xOK) {
+          sensors_event_t humiditySHT4x, tempSHT4x;
+          if (sht4.getEvent(&humiditySHT4x, &tempSHT4x)) {
+            tempsht4x = tempSHT4x.temperature;
+            humsht4x = humiditySHT4x.relative_humidity;
+            Serial.print("SHT4x Temperature: "); Serial.print(tempsht4x); Serial.println(" degrees C");
+            Serial.print("SHT4x Humidity: ");    Serial.print(humsht4x); Serial.println("% rH");
+          } else {
+            Serial.println("SHT4x Read FAIL");
+          }
+        }
+        break;
+
+      case 3:
+        // ------------------- ENS160 (Ambient)
+        if (ENS160OK) {
+          ENS160.setTempAndHum(/*temperature=*/pmsTempC, /*humidity=*/pmsHum);
+          uint8_t Status = ENS160.getENS160Status();
+          Serial.print("ENS160 status: "); Serial.println(Status);
+          Serial.print("AQI: "); Serial.println(ENS160.getAQI());
+          Serial.print("TVOC: "); Serial.print(ENS160.getTVOC()); Serial.println(" ppb");
+          Serial.print("eCO2: "); Serial.print(ENS160.getECO2()); Serial.println(" ppm");
+        }
+        break;
     }
-
-    Serial.print("PM100: ");
-    Serial.print(SDS198PM100);
-    Serial.println(" ug/m3");
-
-    // ------------------- Gas Sensor
-    Serial.print("Ambient ");
-    Serial.print(gas.queryGasType());
-    Serial.print(" concentration is: ");
-    Serial.print(gas.readGasConcentrationPPM());
-    Serial.println(" %vol");
-    Serial.println();
-
-    // ------------------- SHT4x
-    if (SHT4xOK) {
-      sensors_event_t humiditySHT4x, tempSHT4x;
-      if (sht4.getEvent(&humiditySHT4x, &tempSHT4x)) {
-        tempsht4x = tempSHT4x.temperature;
-        humsht4x = humiditySHT4x.relative_humidity;
-        Serial.print("SHT4x Temperature: "); Serial.print(tempsht4x); Serial.println(" degrees C");
-        Serial.print("SHT4x Humidity: ");    Serial.print(humsht4x); Serial.println("% rH");
-      } else {
-        Serial.println("SHT4x Read FAIL");
-      }
+    
+    sensorReadState++;
+    if (sensorReadState > 3) {
+      sensorReadState = 0;
     }
-
-    // ------------------- ENS160 (Ambient)
-    ENS160.setTempAndHum(/*temperature=*/pmsTempC, /*humidity=*/pmsHum);
-    uint8_t Status = ENS160.getENS160Status();
-    Serial.print("ENS160 status: "); Serial.println(Status);
-    Serial.print("AQI: "); Serial.println(ENS160.getAQI());
-    Serial.print("TVOC: "); Serial.print(ENS160.getTVOC()); Serial.println(" ppb");
-    Serial.print("eCO2: "); Serial.print(ENS160.getECO2()); Serial.println(" ppm");
   }
 
   // First Loop Logic
