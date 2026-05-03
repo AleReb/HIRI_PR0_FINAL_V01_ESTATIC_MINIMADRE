@@ -17,6 +17,7 @@ extern bool atTick(bool &done, bool &ok);
 extern bool atRun(const String &cmd, const String &expect1,
                   const String &expect2, uint32_t timeout_ms);
 extern bool sendAtSync(const String &cmd, String &resp, uint32_t timeout_ms);
+extern void yieldLoopTasks();
 
 // Variables for PDP reconnect (kept local static as they are implementation
 // details)
@@ -56,17 +57,17 @@ bool ensurePdpAndNet() {
 
     // MINI-LOOP CON WATCHDOG RESET: modem.gprsConnect() puede bloquear 10-60s
     // Alimentamos el watchdog cada 1s para evitar reset del ESP32
-    uint32_t reconStart = millis();
+    // Solo se intenta 2 veces para no bloquear el loop por mucho tiempo
     bool reconOk = false;
-    while (millis() - reconStart < PDP_RECONNECT_TIMEOUT_MS) {
-      esp_task_wdt_reset(); // Evitar watchdog timeout cada 1s
+    for (int i = 0; i < 2; i++) {
+      esp_task_wdt_reset();
 
       if (modem.gprsConnect(apn, gprsUser, gprsPass)) {
         reconOk = true;
         break;
       }
-
-      delay(1000); // Esperar 1s entre intentos internos
+      
+      if (i == 0) delay(1000);
     }
 
     if (!reconOk) {
@@ -167,6 +168,7 @@ bool httpGet_webhook(const String &fullUrl) {
 
     while (!actionDone) {
       esp_task_wdt_reset(); // Reset watchdog para evitar timeout durante HTTP
+      yieldLoopTasks();     // Mantiene vivos botones, sensores y OLED mientras se espera el HTTP
 
       if (atTick(actionDone, actionOk))
         break;

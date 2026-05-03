@@ -12,6 +12,8 @@ extern bool rtcOK, SDOK, loggingEnabled, xtraLastOk;
 extern uint32_t sdSaveCounter, sendCounter;
 extern String csvFileName, logFilePath;
 extern uint8_t lastDayLogged;
+extern float lastGasPpm;
+extern uint16_t lastTvoc, lastEco2, lastAqi;
 // Genera nombre diario de CSV usando prefijo de dispositivo + fecha RTC.
 // Permite rotación por día y continuidad de trazabilidad en terreno.
 String generateCSVFileName() {
@@ -109,10 +111,10 @@ bool saveCSVData() {
                 sht31Humidity + "," + String(tempsht4x, 2) + "," + 
                 String(humsht4x, 2) + "," + rebootReason + "," + 
                 String(SDS198PM100) + "," +
-                (GasOK ? String(gas.readGasConcentrationPPM(), 2) : "0") + "," +
-                (ENS160OK ? String(ENS160.getTVOC()) : "0") + "," +
-                (ENS160OK ? String(ENS160.getECO2()) : "0") + "," +
-                (ENS160OK ? String(ENS160.getAQI()) : "0") + "," +
+                (GasOK ? String(lastGasPpm, 2) : "0") + "," +
+                (ENS160OK ? String(lastTvoc) : "0") + "," +
+                (ENS160OK ? String(lastEco2) : "0") + "," +
+                (ENS160OK ? String(lastAqi) : "0") + "," +
                 currentNote;
 
   File f = SD.open(csvFileName, FILE_APPEND);

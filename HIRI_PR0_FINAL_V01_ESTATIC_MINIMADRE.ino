@@ -144,6 +144,12 @@ String satellitesStr = "0", hdopStr = "N/A", gpsAlt = "N/A";
 String gpsStatus = "NoFix";
 String gpsSpeedKmh = "0.0";
 
+// Cached Sensor Variables for non-blocking SD writes
+float lastGasPpm = 0.0;
+uint16_t lastTvoc = 0;
+uint16_t lastEco2 = 0;
+uint16_t lastAqi = 0;
+
 // Internal Logic Variables
 bool loggingEnabled = false;
 bool streaming = false;
@@ -650,6 +656,62 @@ void handleButtonLogic() {
   }
 }
 
+// -------------------- YIELD TASKS --------------------
+// Mantiene vivos los sensores, botones y pantalla mientras se espera por procesos lentos (ej. HTTP)
+void yieldLoopTasks() {
+  esp_task_wdt_reset();
+
+  // 1. Manejo de botones
+  handleButtonLogic();
+
+  // 2. Refresco de pantalla
+  static uint32_t lastDisplayUpdate = 0;
+  if (millis() - lastDisplayUpdate > 60) {
+    lastDisplayUpdate = millis();
+    renderDisplay();
+  }
+
+  // 3. Máquina de estados de sensores asincrónica
+  static uint32_t lastSensorUpdateMs = 0;
+  static uint8_t sensorReadState = 0;
+  
+  if (millis() - lastSensorUpdateMs >= 500) {
+    lastSensorUpdateMs = millis();
+    
+    switch (sensorReadState) {
+      case 0:
+        if (rtcOK) rtcTempC = rtc.getTemperature();
+        break;
+
+      case 1:
+        if (GasOK) lastGasPpm = gas.readGasConcentrationPPM();
+        break;
+
+      case 2:
+        if (SHT4xOK) {
+          sensors_event_t humiditySHT4x, tempSHT4x;
+          if (sht4.getEvent(&humiditySHT4x, &tempSHT4x)) {
+            tempsht4x = tempSHT4x.temperature;
+            humsht4x = humiditySHT4x.relative_humidity;
+          }
+        }
+        break;
+
+      case 3:
+        if (ENS160OK) {
+          ENS160.setTempAndHum(/*temperature=*/pmsTempC, /*humidity=*/pmsHum);
+          lastAqi = ENS160.getAQI();
+          lastTvoc = ENS160.getTVOC();
+          lastEco2 = ENS160.getECO2();
+        }
+        break;
+    }
+    
+    sensorReadState++;
+    if (sensorReadState > 3) sensorReadState = 0;
+  }
+}
+
 // -------------------- SETUP --------------------
 // Inicializa hardware, configuración persistente y servicios base del firmware.
 // Define estado de arranque seguro y prepara módem/GNSS/SD/UI para operación.
@@ -886,34 +948,37 @@ const uint32_t DEBUG_ROTATION_INTERVAL_MS = 10000;
   // LED heartbeat during modem startup (visual anti-freeze feedback)
   bool modemBlinkState = false;
   int dot = 1;
-  for (int i = 0; i < 3; i++) {
+  bool modemOk = false;
+  for (int i = 0; i < 10; i++) {
 
-    //dot++;
-    while (!modem.testAT(1000)) {
-      Serial.println("[MODEM] Retry...");
-      oledStatus("MODEM", "Retry: ", String(dot));
-      // Blink RGB while retrying modem init
-      modemBlinkState = !modemBlinkState;
-      if (modemBlinkState) {
-        pixels.setPixelColor(0, pixels.Color(0, 0, 80)); // soft blue
-      } else {
-        pixels.setPixelColor(0, pixels.Color(0, 0, 0));
-         dot++;
-      }
-      pixels.show();
-
-      // digitalWrite(MODEM_PWRKEY, HIGH);
-      // delay(300);
-      // digitalWrite(MODEM_PWRKEY, LOW);
-      delay(1000);
+    if (modem.testAT(1000)) {
+      modemOk = true;
+      break;
     }
+    
+    Serial.println("[MODEM] Retry...");
+    oledStatus("MODEM", "Retry: ", String(dot));
+    // Blink RGB while retrying modem init
+    modemBlinkState = !modemBlinkState;
+    if (modemBlinkState) {
+      pixels.setPixelColor(0, pixels.Color(0, 0, 80)); // soft blue
+    } else {
+      pixels.setPixelColor(0, pixels.Color(0, 0, 0));
+       dot++;
+    }
+    pixels.show();
+    delay(1000);
   }
 
-  // Solid blue when modem is ready
-  pixels.setPixelColor(0, pixels.Color(0, 50, 100));
-  pixels.show();
-
-  oledStatus("MODEM", "OK");
+  if (!modemOk) {
+    Serial.println("[MODEM] FAIL TO RESPOND AT");
+    oledStatus("MODEM", "FAIL");
+  } else {
+    // Solid blue when modem is ready
+    pixels.setPixelColor(0, pixels.Color(0, 50, 100));
+    pixels.show();
+    oledStatus("MODEM", "OK");
+  }
 
   // Modem setup
   atRun("+CEDRXS=0", "OK", "ERROR", 1500);
@@ -1011,10 +1076,6 @@ void loop() {
     ESP.restart();
   }
 
-  // Button flags
-  // Button Logic (State Check & Dispatch)
-  handleButtonLogic();
-
   if (wifiModeActive) {
     // Modo WiFi Exclusivo:
     // 1. Procesa DNS (Portal Cautivo)
@@ -1052,69 +1113,8 @@ void loop() {
   gnssDiagTick();
   gnssDebugPollAsync();
 
-  // Sensors refresh asynchronous state machine (reads one sensor per interval)
-  static uint32_t lastSensorUpdateMs = 0;
-  static uint8_t sensorReadState = 0;
-  
-  if (millis() - lastSensorUpdateMs >= 500) { // Every 500ms we advance the state
-    lastSensorUpdateMs = millis();
-    
-    switch (sensorReadState) {
-      case 0:
-        // ------------------- RTC Temperature & Print PM100
-        if (rtcOK) {
-          rtcTempC = rtc.getTemperature();
-        }
-        Serial.print("PM100: ");
-        Serial.print(SDS198PM100);
-        Serial.println(" ug/m3");
-        break;
-
-      case 1:
-        // ------------------- Gas Sensor
-        if (GasOK) {
-          Serial.print("Ambient ");
-          Serial.print(gas.queryGasType());
-          Serial.print(" concentration is: ");
-          Serial.print(gas.readGasConcentrationPPM());
-          Serial.println(" %vol");
-          Serial.println();
-        }
-        break;
-
-      case 2:
-        // ------------------- SHT4x
-        if (SHT4xOK) {
-          sensors_event_t humiditySHT4x, tempSHT4x;
-          if (sht4.getEvent(&humiditySHT4x, &tempSHT4x)) {
-            tempsht4x = tempSHT4x.temperature;
-            humsht4x = humiditySHT4x.relative_humidity;
-            Serial.print("SHT4x Temperature: "); Serial.print(tempsht4x); Serial.println(" degrees C");
-            Serial.print("SHT4x Humidity: ");    Serial.print(humsht4x); Serial.println("% rH");
-          } else {
-            Serial.println("SHT4x Read FAIL");
-          }
-        }
-        break;
-
-      case 3:
-        // ------------------- ENS160 (Ambient)
-        if (ENS160OK) {
-          ENS160.setTempAndHum(/*temperature=*/pmsTempC, /*humidity=*/pmsHum);
-          uint8_t Status = ENS160.getENS160Status();
-          Serial.print("ENS160 status: "); Serial.println(Status);
-          Serial.print("AQI: "); Serial.println(ENS160.getAQI());
-          Serial.print("TVOC: "); Serial.print(ENS160.getTVOC()); Serial.println(" ppb");
-          Serial.print("eCO2: "); Serial.print(ENS160.getECO2()); Serial.println(" ppm");
-        }
-        break;
-    }
-    
-    sensorReadState++;
-    if (sensorReadState > 3) {
-      sensorReadState = 0;
-    }
-  }
+  // Mantener vivos los sensores, botones y pantalla (sin bloquear el loop principal)
+  yieldLoopTasks();
 
   // First Loop Logic
   if (FirstLoop) {
@@ -1173,12 +1173,7 @@ void loop() {
     }
   }
 
-  // Display Update
-  static uint32_t lastDisplayUpdate = 0;
-  if (millis() - lastDisplayUpdate > 60) {
-    lastDisplayUpdate = millis();
-    renderDisplay();
-  }
+  // Display Update ya está manejado por yieldLoopTasks(), lo omitimos aquí para no duplicar
 
   // Auto Off
   if (config.oledAutoOff &&
